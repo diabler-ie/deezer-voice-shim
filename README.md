@@ -2,7 +2,7 @@
 
 > **Research / personal-use only.** This project impersonates a third-party package identifier and accesses Deezer via an unofficial protocol. Use it with your own Deezer Premium account, on your own device. Released APKs are convenience builds for individual hobbyist sideloading — please don't repackage them into commercial products or hosted services. See [LICENSE](LICENSE).
 
-A small Android app that makes Google Gemini's voice routing play your music on Deezer — by impersonating Spotify's package name, intercepting the voice intent, and playing the resolved track via a custom Deezer streaming player.
+A small Android app that makes Google Gemini's voice routing play your music on Deezer — by impersonating Spotify's package name, intercepting the voice intent, and playing the resolved track via Deezer.
 
 Works on:
 - **Phone**: "Hey Google, play X on Spotify" → audio plays via Deezer
