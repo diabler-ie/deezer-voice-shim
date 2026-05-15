@@ -93,7 +93,10 @@ public class ShimMediaBrowserService extends MediaBrowserService {
     @Override
     public BrowserRoot onGetRoot(String clientPackageName, int clientUid, Bundle rootHints) {
         Log.i(TAG, "onGetRoot from clientPackage=" + clientPackageName + " uid=" + clientUid);
-        return new BrowserRoot(MEDIA_ROOT_ID, null);
+        Bundle extras = new Bundle();
+        // Mirroring what real Spotify advertises — declares voice-search support.
+        extras.putBoolean("android.media.browse.SEARCH_SUPPORTED", true);
+        return new BrowserRoot(MEDIA_ROOT_ID, extras);
     }
 
     @Override
