@@ -614,10 +614,17 @@ public class ShimMediaBrowserService extends MediaBrowserService {
     }
 
     private void setErrorState(String msg) {
-        Log.e(TAG, "error state: " + msg);
+        Log.e(TAG, "error state (transitioning back to idle so retries can dispatch): " + msg);
+        // Don't actually park the session in STATE_ERROR — Robin checks the
+        // session's advertised actions before issuing playFromUri, and a
+        // STATE_ERROR session with a reduced action set blocks retries.
+        // Reset to STATE_STOPPED with full transport actions so the next
+        // voice command can re-dispatch.
+        queue = Collections.emptyList();
+        queueIndex = -1;
         PlaybackState state = new PlaybackState.Builder()
-                .setActions(PlaybackState.ACTION_PLAY_FROM_SEARCH)
-                .setState(PlaybackState.STATE_ERROR, 0, 1.0f)
+                .setActions(transportActions())
+                .setState(PlaybackState.STATE_STOPPED, 0, 1.0f)
                 .build();
         session.setPlaybackState(state);
     }
