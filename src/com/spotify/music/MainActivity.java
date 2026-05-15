@@ -31,7 +31,13 @@ public class MainActivity extends Activity {
         Log.i(TAG, "MainActivity launched action=" + intent.getAction()
                 + " data=" + intent.getData());
 
-        if (!Intent.ACTION_VIEW.equals(intent.getAction()) || extras == null) {
+        // Launched from the launcher icon (MAIN action, no data) -> show config UI.
+        if (!Intent.ACTION_VIEW.equals(intent.getAction()) || intent.getData() == null) {
+            startActivity(new Intent(this, ConfigActivity.class));
+            finish();
+            return;
+        }
+        if (extras == null) {
             finish();
             return;
         }

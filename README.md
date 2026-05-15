@@ -89,6 +89,20 @@ The Spotify URL we receive (`https://open.spotify.com/track/<id>` or `/artist/<i
 
 For Android Auto specifically, Gemini sends `playFromUri` (not `playFromSearch`) — and times out after ~10s if `PlaybackState` doesn't transition to `PLAYING`. The shim must implement `onPlayFromUri` and actually play audio fast enough.
 
+## Features
+
+- **Voice command routing** via Spotify package-name impersonation
+- **Phone path**: deep-link hand-off to the real Deezer app
+- **Android Auto path**: full custom player (auth, search, stream, decrypt, play)
+- **Artist radio**: speaking "Play music by X" loads up to 30 of the artist's top tracks
+- **Album playback**: speaking "Play [album]" loads all album tracks
+- **Playlist playback**: speaking "Play [playlist]" via Deezer's playlist search
+- **Single-track**: speaking "Play [song]" finds and plays one track
+- **Transport controls**: play/pause/skip-next/skip-previous via AA's UI or media keys, with proper `PlaybackState` updates
+- **Audio focus**: requests focus correctly so other media (podcasts, etc.) duck/pause
+- **Foreground service + media notification** during playback
+- **In-app config UI**: tap the launcher icon to paste/manage the ARL cookie
+
 ## Project layout
 
 ```
@@ -161,7 +175,8 @@ adb shell am startservice -n com.spotify.music/.ShimMediaBrowserService \
 - **Requires Deezer Premium / HiFi for full-quality streams**. Free accounts only get 30s previews through the public API.
 - **Personal use only.** The ARL is your account credential; treat it like a password. Don't redistribute the resulting APK.
 - **ARL eventually expires** (typical: months). Re-run the configure step with a fresh ARL when it does.
-- **Currently single-track**: artist-radio queue / album / playlist handling are TODO.
+- **Album/playlist matching is best-effort.** Gemini's NLU resolves the user's voice to a *specific Spotify catalog entry* and sends us that album/playlist as extras. Deezer's catalog of multi-artist compilations rarely matches Spotify's exactly (different curation, different licensing per region), so a query like *"play Top Hits 2024 on Spotify"* may land on a different "Top Hits 2024" compilation in Deezer than what Spotify has. Single tracks and artist radio work cleanly; albums/playlists are reasonable but imperfect.
+- **Compilation albums** (`artist=Various Artists`) are routed through Deezer's playlist search as a fallback, since Spotify often classifies "Top Hits"-style compilations as albums but Deezer treats them as playlists.
 
 ## Legal / use
 

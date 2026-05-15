@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.util.List;
 import java.net.CookieHandler;
 import java.net.CookieManager;
 import java.net.CookiePolicy;
@@ -117,23 +118,161 @@ public class DeezerClient {
     }
 
     public Track searchTrack(String query) throws IOException {
-        String url = PUBLIC_API + "/search?q="
-                + URLEncoder.encode(query, "UTF-8") + "&limit=1";
+        List<Track> tracks = searchTracks(query, 1);
+        if (tracks.isEmpty()) throw new IOException("no results");
+        return tracks.get(0);
+    }
+
+    public List<Track> searchTracks(String query, int limit) throws IOException {
+        return parseTrackList(getJson(PUBLIC_API + "/search?q="
+                + URLEncoder.encode(query, "UTF-8") + "&limit=" + limit));
+    }
+
+    /** Top tracks for an artist matched by name. */
+    public List<Track> artistTopTracks(String artistName, int limit) throws IOException {
+        // First resolve artist name → artist id
+        JSONObject artistResp = getJson(PUBLIC_API + "/search/artist?q="
+                + URLEncoder.encode(artistName, "UTF-8") + "&limit=1");
+        try {
+            JSONArray data = artistResp.getJSONArray("data");
+            if (data.length() == 0) throw new IOException("artist not found: " + artistName);
+            long artistId = data.getJSONObject(0).getLong("id");
+            // Then fetch top tracks
+            return parseTrackList(getJson(PUBLIC_API + "/artist/" + artistId
+                    + "/top?limit=" + limit));
+        } catch (IOException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IOException("artistTopTracks parse failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** Tracks of an album matched by name (with optional artist hint). */
+    public List<Track> albumTracks(String albumName, String artistHint, int limit) throws IOException {
+        // /search/album?q= takes plain text; the field-prefix syntax (album:"x")
+        // only works on the general /search endpoint and returns inconsistent
+        // results, so we just concatenate.
+        String q = artistHint != null && !artistHint.isEmpty()
+                ? albumName + " " + artistHint
+                : albumName;
+        JSONObject albumResp = getJson(PUBLIC_API + "/search/album?q="
+                + URLEncoder.encode(q, "UTF-8") + "&limit=5");
+        long albumId = pickBestMatch(albumResp, "title", albumName, "artist", artistHint);
+        if (albumId < 0) {
+            throw new IOException("album not found: " + albumName
+                    + (artistHint == null ? "" : " by " + artistHint));
+        }
+        try {
+            // /album/{id} returns the whole album incl. nested tracks
+            JSONObject album = getJson(PUBLIC_API + "/album/" + albumId);
+            JSONObject tracksObj = album.getJSONObject("tracks");
+            JSONArray tracks = tracksObj.getJSONArray("data");
+            JSONObject artistObj = album.optJSONObject("artist");
+            String fallbackArtist = artistObj == null ? null : artistObj.optString("name");
+            return parseTrackArray(tracks, limit, fallbackArtist);
+        } catch (Exception e) {
+            throw new IOException("albumTracks parse failed: " + e.getMessage(), e);
+        }
+    }
+
+    /** Tracks of a playlist matched by name. */
+    public List<Track> playlistTracks(String playlistName, int limit) throws IOException {
+        JSONObject plResp = getJson(PUBLIC_API + "/search/playlist?q="
+                + URLEncoder.encode(playlistName, "UTF-8") + "&limit=5");
+        long plId = pickBestMatch(plResp, "title", playlistName, null, null);
+        if (plId < 0) {
+            throw new IOException("playlist not found: " + playlistName);
+        }
+        try {
+            JSONObject pl = getJson(PUBLIC_API + "/playlist/" + plId);
+            JSONObject tracksObj = pl.getJSONObject("tracks");
+            JSONArray tracks = tracksObj.getJSONArray("data");
+            return parseTrackArray(tracks, limit, null);
+        } catch (Exception e) {
+            throw new IOException("playlistTracks parse failed: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Score the search results and return the best matching id. We prefer
+     * results whose primary field (title) is a case-insensitive substring
+     * match of the user's query, with the secondary field (e.g. artist
+     * name) as a tiebreaker. Returns -1 if no hits at all.
+     */
+    private static long pickBestMatch(JSONObject resp,
+                                       String primaryField, String primaryQuery,
+                                       String secondaryField, String secondaryQuery) {
+        try {
+            JSONArray data = resp.getJSONArray("data");
+            if (data.length() == 0) return -1;
+            String pq = primaryQuery == null ? "" : primaryQuery.toLowerCase();
+            String sq = secondaryQuery == null ? "" : secondaryQuery.toLowerCase();
+            long bestId = -1;
+            int bestScore = -1;
+            for (int i = 0; i < data.length(); i++) {
+                JSONObject o = data.getJSONObject(i);
+                String pv = o.optString(primaryField, "").toLowerCase();
+                int score = 0;
+                if (pv.equals(pq)) score += 100;
+                else if (pv.contains(pq) || pq.contains(pv)) score += 50;
+                if (secondaryField != null && !sq.isEmpty()) {
+                    JSONObject inner = o.optJSONObject(secondaryField);
+                    if (inner != null) {
+                        String iv = inner.optString("name", "").toLowerCase();
+                        if (iv.equals(sq)) score += 30;
+                        else if (iv.contains(sq) || sq.contains(iv)) score += 10;
+                    }
+                }
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestId = o.optLong("id", -1);
+                }
+            }
+            if (bestId < 0 && data.length() > 0) {
+                // Fall back to first result if scoring produced no winner
+                bestId = data.getJSONObject(0).optLong("id", -1);
+            }
+            return bestId;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    private JSONObject getJson(String url) throws IOException {
         HttpURLConnection c = open(url);
         c.setRequestMethod("GET");
-        String body = readAll(c);
         try {
-            JSONObject root = new JSONObject(body);
-            JSONArray data = root.getJSONArray("data");
-            if (data.length() == 0) throw new IOException("no results");
-            JSONObject t = data.getJSONObject(0);
-            return new Track(
-                    String.valueOf(t.getLong("id")),
-                    t.getString("title"),
-                    t.getJSONObject("artist").getString("name"));
+            return new JSONObject(readAll(c));
         } catch (Exception e) {
-            throw new IOException("search parse failed: " + e.getMessage(), e);
+            throw new IOException("json parse failed: " + e.getMessage(), e);
         }
+    }
+
+    private List<Track> parseTrackList(JSONObject root) throws IOException {
+        try {
+            JSONArray data = root.getJSONArray("data");
+            return parseTrackArray(data, data.length(), null);
+        } catch (Exception e) {
+            throw new IOException("trackList parse failed: " + e.getMessage(), e);
+        }
+    }
+
+    private List<Track> parseTrackArray(JSONArray arr, int limit, String fallbackArtist)
+            throws Exception {
+        List<Track> out = new java.util.ArrayList<>();
+        int n = Math.min(arr.length(), limit);
+        for (int i = 0; i < n; i++) {
+            JSONObject t = arr.getJSONObject(i);
+            String artist;
+            JSONObject artistObj = t.optJSONObject("artist");
+            if (artistObj != null) artist = artistObj.optString("name", "");
+            else artist = fallbackArtist == null ? "" : fallbackArtist;
+            out.add(new Track(
+                    String.valueOf(t.getLong("id")),
+                    t.optString("title", ""),
+                    artist));
+        }
+        return out;
     }
 
     public StreamInfo getStreamInfo(String trackId) throws IOException {

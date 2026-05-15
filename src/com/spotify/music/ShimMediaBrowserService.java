@@ -25,6 +25,7 @@ import android.util.Log;
 
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 
 /**
@@ -44,11 +45,12 @@ public class ShimMediaBrowserService extends MediaBrowserService {
     private MediaSession session;
     private MediaPlayer player;
     private StreamingMediaDataSource currentSource;
-    private DeezerClient.Track currentTrack;
     private DeezerClient client;
     private AudioManager audioManager;
     private AudioFocusRequest focusRequest;
     private final Handler main = new Handler(Looper.getMainLooper());
+    private List<DeezerClient.Track> queue = Collections.emptyList();
+    private int queueIndex = -1;
     private static final AudioAttributes AUDIO_ATTRS = new AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -118,23 +120,22 @@ public class ShimMediaBrowserService extends MediaBrowserService {
         public void onPlayFromSearch(String query, Bundle extras) {
             Log.i(TAG, "onPlayFromSearch query=\"" + query + "\"");
             logExtras(extras);
-            String enriched = svc.enrichQuery(query, extras);
-            svc.playFromQuery(enriched);
+            // Build extras that include the spoken query as a title so we can
+            // fall through to single-track search if focus isn't set.
+            Bundle e = extras == null ? new Bundle() : new Bundle(extras);
+            if (query != null && !query.isEmpty() && e.getString("android.intent.extra.title") == null) {
+                e.putString("android.intent.extra.title", query);
+            }
+            svc.loadQueueAndPlay(null, e);
         }
 
         @Override
         public void onPlayFromUri(android.net.Uri uri, Bundle extras) {
             Log.i(TAG, "onPlayFromUri uri=" + uri);
             logExtras(extras);
-            // Robin sends Spotify URLs like https://open.spotify.com/track/<id>
-            // with structured artist/title/album in extras. The Spotify ID is
-            // useless to us; the structured extras are the source of truth.
-            String query = svc.enrichQuery(null, extras);
-            if (query.isEmpty() && uri != null) {
-                // Fallback if extras are missing: just send the URL text
-                query = uri.toString();
-            }
-            svc.playFromQuery(query);
+            // Robin sends Spotify URLs (different catalog, useless to us);
+            // structured extras are the source of truth.
+            svc.loadQueueAndPlay(uri, extras);
         }
 
         @Override
@@ -179,12 +180,19 @@ public class ShimMediaBrowserService extends MediaBrowserService {
 
         @Override
         public void onSkipToNext() {
-            Log.i(TAG, "onSkipToNext (no queue yet)");
+            Log.i(TAG, "onSkipToNext");
+            svc.skipTo(svc.queueIndex + 1);
         }
 
         @Override
         public void onSkipToPrevious() {
-            Log.i(TAG, "onSkipToPrevious (no queue yet)");
+            Log.i(TAG, "onSkipToPrevious");
+            // If we're more than ~3s into the current track, restart it rather than going back
+            if (svc.player != null && svc.player.getCurrentPosition() > 3000) {
+                svc.player.seekTo(0);
+            } else {
+                svc.skipTo(svc.queueIndex - 1);
+            }
         }
 
         @Override
@@ -211,20 +219,33 @@ public class ShimMediaBrowserService extends MediaBrowserService {
         return q.toString();
     }
 
-    /** Public entry point: search Deezer for the query and play the top match. */
+    /** Single-track entry point (used by direct adb-driven test). */
     void playFromQuery(final String query) {
-        Log.i(TAG, "playFromQuery: " + query);
-        setBufferingState();
-        new Thread(new PlayRunnable(this, query), "DeezerPlay").start();
+        Bundle b = new Bundle();
+        b.putString("android.intent.extra.title", query);
+        loadQueueAndPlay(null, b);
     }
 
-    private static class PlayRunnable implements Runnable {
-        private final ShimMediaBrowserService svc;
-        private final String query;
+    /**
+     * Build a play queue from a voice intent's structured extras and start
+     * playing the first item. The extras' "focus" indicates artist vs album
+     * vs playlist vs track; the appropriate Deezer endpoint is queried.
+     */
+    void loadQueueAndPlay(android.net.Uri uri, Bundle extras) {
+        Log.i(TAG, "loadQueueAndPlay focus="
+                + (extras == null ? "null" : extras.getString("android.intent.extra.focus"))
+                + " uri=" + uri);
+        setBufferingState();
+        new Thread(new QueueLoader(this, extras), "DeezerQueueLoader").start();
+    }
 
-        PlayRunnable(ShimMediaBrowserService svc, String query) {
+    private static class QueueLoader implements Runnable {
+        private final ShimMediaBrowserService svc;
+        private final Bundle extras;
+
+        QueueLoader(ShimMediaBrowserService svc, Bundle extras) {
             this.svc = svc;
-            this.query = query;
+            this.extras = extras;
         }
 
         @Override
@@ -238,12 +259,130 @@ public class ShimMediaBrowserService extends MediaBrowserService {
                 }
                 if (svc.client == null) svc.client = new DeezerClient(arl);
                 svc.client.authenticate();
-                final DeezerClient.Track track = svc.client.searchTrack(query);
-                Log.i(TAG, "resolved " + track.id + " " + track.title + " — " + track.artist);
-                final DeezerClient.StreamInfo info = svc.client.getStreamInfo(track.id);
+
+                String focus = extras == null ? null : extras.getString("android.intent.extra.focus");
+                String artist = extras == null ? null : extras.getString("android.intent.extra.artist");
+                String title  = extras == null ? null : extras.getString("android.intent.extra.title");
+                String album  = extras == null ? null : extras.getString("android.intent.extra.album");
+                String playlist = extras == null ? null : extras.getString("android.intent.extra.playlist");
+                String genre  = extras == null ? null : extras.getString("android.intent.extra.genre");
+
+                List<DeezerClient.Track> tracks;
+                if ("vnd.android.cursor.item/artist".equals(focus)
+                        && artist != null && (title == null || title.isEmpty())) {
+                    Log.i(TAG, "artist mode: " + artist);
+                    tracks = svc.client.artistTopTracks(artist, 30);
+                } else if ("vnd.android.cursor.item/album".equals(focus)
+                        && album != null) {
+                    boolean compilation = artist == null
+                            || artist.isEmpty()
+                            || "Various Artists".equalsIgnoreCase(artist);
+                    if (compilation) {
+                        // Gemini often classifies "Top Hits 2024"-style compilations
+                        // as albums with artist="Various Artists". Deezer's catalog
+                        // of such compilations rarely matches Spotify's by name —
+                        // playlists are usually a better fit for that intent.
+                        Log.i(TAG, "compilation album mode: " + album + " (trying playlist first)");
+                        try {
+                            tracks = svc.client.playlistTracks(album, 100);
+                        } catch (Exception pe) {
+                            Log.w(TAG, "playlist fallback failed, trying album: " + pe.getMessage());
+                            tracks = svc.client.albumTracks(album, artist, 100);
+                        }
+                    } else {
+                        Log.i(TAG, "album mode: " + album + " (artist hint=" + artist + ")");
+                        tracks = svc.client.albumTracks(album, artist, 100);
+                    }
+                } else if ("vnd.android.cursor.item/playlist".equals(focus)
+                        && playlist != null) {
+                    Log.i(TAG, "playlist mode: " + playlist);
+                    tracks = svc.client.playlistTracks(playlist, 100);
+                } else if ("vnd.android.cursor.item/genre".equals(focus)
+                        && genre != null) {
+                    Log.i(TAG, "genre mode (as artist top tracks fallback): " + genre);
+                    tracks = svc.client.searchTracks(genre, 30);
+                } else {
+                    // track or unknown
+                    StringBuilder q = new StringBuilder();
+                    if (title != null) q.append(title);
+                    if (artist != null) {
+                        if (q.length() > 0) q.append(' ');
+                        q.append(artist);
+                    }
+                    if (q.length() == 0 && playlist != null) q.append(playlist);
+                    if (q.length() == 0 && album != null) q.append(album);
+                    if (q.length() == 0 && genre != null) q.append(genre);
+                    String query = q.toString().trim();
+                    if (query.isEmpty()) {
+                        svc.setErrorState("empty query");
+                        return;
+                    }
+                    Log.i(TAG, "single-track mode: " + query);
+                    tracks = svc.client.searchTracks(query, 1);
+                }
+
+                if (tracks.isEmpty()) {
+                    svc.setErrorState("no tracks found");
+                    return;
+                }
+                Log.i(TAG, "loaded queue: " + tracks.size() + " tracks");
+                svc.main.post(new QueueReadyRunnable(svc, tracks));
+            } catch (Exception e) {
+                Log.e(TAG, "loadQueue failed", e);
+                svc.setErrorState(e.getMessage());
+            }
+        }
+    }
+
+    private static class QueueReadyRunnable implements Runnable {
+        private final ShimMediaBrowserService svc;
+        private final List<DeezerClient.Track> tracks;
+
+        QueueReadyRunnable(ShimMediaBrowserService svc, List<DeezerClient.Track> tracks) {
+            this.svc = svc;
+            this.tracks = tracks;
+        }
+
+        @Override
+        public void run() {
+            svc.queue = tracks;
+            svc.queueIndex = 0;
+            svc.startCurrentTrack();
+        }
+    }
+
+    /** Must run on main thread. Plays queue[queueIndex]. */
+    private void startCurrentTrack() {
+        if (queueIndex < 0 || queueIndex >= queue.size()) {
+            Log.i(TAG, "queue exhausted at index " + queueIndex);
+            setIdleState();
+            stopForeground(STOP_FOREGROUND_REMOVE);
+            return;
+        }
+        final DeezerClient.Track track = queue.get(queueIndex);
+        Log.i(TAG, "startCurrentTrack [" + (queueIndex + 1) + "/" + queue.size()
+                + "] " + track.title + " — " + track.artist);
+        setBufferingState();
+        updateMetadata(track);
+        new Thread(new ResolveStreamRunnable(this, track), "DeezerResolve").start();
+    }
+
+    private static class ResolveStreamRunnable implements Runnable {
+        private final ShimMediaBrowserService svc;
+        private final DeezerClient.Track track;
+
+        ResolveStreamRunnable(ShimMediaBrowserService svc, DeezerClient.Track track) {
+            this.svc = svc;
+            this.track = track;
+        }
+
+        @Override
+        public void run() {
+            try {
+                DeezerClient.StreamInfo info = svc.client.getStreamInfo(track.id);
                 svc.main.post(new StartPlaybackRunnable(svc, track, info));
             } catch (Exception e) {
-                Log.e(TAG, "playFromQuery failed", e);
+                Log.e(TAG, "resolve stream failed", e);
                 svc.setErrorState(e.getMessage());
             }
         }
@@ -268,10 +407,18 @@ public class ShimMediaBrowserService extends MediaBrowserService {
         }
     }
 
+    void skipTo(int newIndex) {
+        if (newIndex < 0 || newIndex >= queue.size()) {
+            Log.i(TAG, "skipTo out of range: " + newIndex + " (queue size=" + queue.size() + ")");
+            return;
+        }
+        queueIndex = newIndex;
+        startCurrentTrack();
+    }
+
     /** Must run on main thread. */
     private void startPlayback(DeezerClient.Track track, DeezerClient.StreamInfo info) {
         teardownPlayer();
-        currentTrack = track;
         try {
             if (!requestFocus()) {
                 Log.w(TAG, "audio focus denied; aborting playback");
@@ -322,9 +469,16 @@ public class ShimMediaBrowserService extends MediaBrowserService {
         OnCompletionListenerImpl(ShimMediaBrowserService svc) { this.svc = svc; }
         @Override
         public void onCompletion(MediaPlayer mp) {
-            Log.i(TAG, "MediaPlayer completion");
-            svc.setIdleState();
-            svc.stopForeground(STOP_FOREGROUND_REMOVE);
+            Log.i(TAG, "MediaPlayer completion; advancing queue");
+            if (svc.queueIndex + 1 < svc.queue.size()) {
+                svc.skipTo(svc.queueIndex + 1);
+            } else {
+                Log.i(TAG, "queue end");
+                svc.queue = Collections.emptyList();
+                svc.queueIndex = -1;
+                svc.setIdleState();
+                svc.stopForeground(STOP_FOREGROUND_REMOVE);
+            }
         }
     }
 
@@ -418,11 +572,26 @@ public class ShimMediaBrowserService extends MediaBrowserService {
         session.setPlaybackState(state);
     }
 
+    private long transportActions() {
+        long a = PlaybackState.ACTION_PAUSE
+                | PlaybackState.ACTION_PLAY
+                | PlaybackState.ACTION_STOP
+                | PlaybackState.ACTION_PLAY_FROM_SEARCH
+                | PlaybackState.ACTION_PLAY_FROM_URI
+                | PlaybackState.ACTION_PLAY_FROM_MEDIA_ID
+                | PlaybackState.ACTION_SEEK_TO;
+        if (queueIndex >= 0 && queueIndex + 1 < queue.size()) {
+            a |= PlaybackState.ACTION_SKIP_TO_NEXT;
+        }
+        if (queueIndex > 0) {
+            a |= PlaybackState.ACTION_SKIP_TO_PREVIOUS;
+        }
+        return a;
+    }
+
     private void setBufferingState() {
         PlaybackState state = new PlaybackState.Builder()
-                .setActions(PlaybackState.ACTION_PAUSE
-                        | PlaybackState.ACTION_STOP
-                        | PlaybackState.ACTION_PLAY_FROM_SEARCH)
+                .setActions(transportActions())
                 .setState(PlaybackState.STATE_BUFFERING, 0, 1.0f)
                 .build();
         session.setPlaybackState(state);
@@ -430,10 +599,7 @@ public class ShimMediaBrowserService extends MediaBrowserService {
 
     private void setPlayingState(long position, long duration) {
         PlaybackState state = new PlaybackState.Builder()
-                .setActions(PlaybackState.ACTION_PAUSE
-                        | PlaybackState.ACTION_STOP
-                        | PlaybackState.ACTION_PLAY_FROM_SEARCH
-                        | PlaybackState.ACTION_SEEK_TO)
+                .setActions(transportActions())
                 .setState(PlaybackState.STATE_PLAYING, position, 1.0f)
                 .build();
         session.setPlaybackState(state);
@@ -441,10 +607,7 @@ public class ShimMediaBrowserService extends MediaBrowserService {
 
     private void setPausedState(long position, long duration) {
         PlaybackState state = new PlaybackState.Builder()
-                .setActions(PlaybackState.ACTION_PLAY
-                        | PlaybackState.ACTION_STOP
-                        | PlaybackState.ACTION_PLAY_FROM_SEARCH
-                        | PlaybackState.ACTION_SEEK_TO)
+                .setActions(transportActions())
                 .setState(PlaybackState.STATE_PAUSED, position, 0.0f)
                 .build();
         session.setPlaybackState(state);
@@ -472,11 +635,15 @@ public class ShimMediaBrowserService extends MediaBrowserService {
     // ---- helpers ----
 
     String getArl() {
-        SharedPreferences p = getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+        return readArl(this);
+    }
+
+    public static String readArl(Context ctx) {
+        SharedPreferences p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         return p.getString(PREF_ARL, null);
     }
 
-    static void saveArl(Context ctx, String arl) {
+    public static void saveArl(Context ctx, String arl) {
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                 .edit().putString(PREF_ARL, arl).apply();
     }

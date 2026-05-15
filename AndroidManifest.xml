@@ -46,6 +46,10 @@
         <activity android:name="com.spotify.music.DeezerTestActivity"
                   android:exported="true"/>
 
+        <activity android:name="com.spotify.music.ConfigActivity"
+                  android:exported="false"
+                  android:label="@string/app_name"/>
+
         <service android:name="com.spotify.music.ShimMediaBrowserService"
                  android:exported="true"
                  android:foregroundServiceType="mediaPlayback">
