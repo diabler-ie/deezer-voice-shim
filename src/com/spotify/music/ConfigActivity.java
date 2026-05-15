@@ -1,6 +1,7 @@
 package com.spotify.music;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.os.Bundle;
 import android.text.InputType;
 import android.text.method.ScrollingMovementMethod;
@@ -20,6 +21,7 @@ import android.widget.Toast;
 public class ConfigActivity extends Activity {
     private EditText arlField;
     private TextView statusView;
+    private Button signInButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -36,14 +38,17 @@ public class ConfigActivity extends Activity {
         title.setPadding(0, 0, 0, dp(8));
         root.addView(title);
 
+        signInButton = new Button(this);
+        signInButton.setOnClickListener(new SignInClick(this));
+        root.addView(signInButton);
+
         TextView help = new TextView(this);
         help.setText(
-                "Paste your Deezer ARL cookie below.\n\n"
-                + "How to get it: log into deezer.com in a browser, "
-                + "open DevTools → Application/Storage → Cookies "
-                + "→ www.deezer.com → 'arl' value. Treat it like "
-                + "a password.");
-        help.setPadding(0, 0, 0, dp(12));
+                "Tap \"Sign in to Deezer\" above to log in via Deezer's "
+                + "own login page; your ARL is captured automatically.\n\n"
+                + "Or paste an ARL cookie manually below (advanced — extract "
+                + "via DevTools on deezer.com). Treat it like a password.");
+        help.setPadding(0, dp(8), 0, dp(12));
         root.addView(help);
 
         arlField = new EditText(this);
@@ -82,16 +87,25 @@ public class ConfigActivity extends Activity {
         refreshStatus();
     }
 
+    @Override
+    protected void onResume() {
+        super.onResume();
+        refreshStatus();
+    }
+
     private void refreshStatus() {
         String arl = ShimMediaBrowserService.readArl(this);
         if (arl == null || arl.isEmpty()) {
-            statusView.setText("Status: no ARL configured");
+            statusView.setText("Status: not signed in");
+            signInButton.setText("Sign in to Deezer");
             arlField.setText("");
         } else {
             int len = arl.length();
             String masked = arl.substring(0, Math.min(6, len)) + "..."
                     + arl.substring(Math.max(0, len - 4));
-            statusView.setText("Status: ARL set (" + len + " chars, " + masked + ")");
+            statusView.setText("✓ Signed in to Deezer — ARL captured ("
+                    + len + " chars, " + masked + ")");
+            signInButton.setText("Sign in again (refresh ARL)");
         }
     }
 
@@ -112,6 +126,15 @@ public class ConfigActivity extends Activity {
             ShimMediaBrowserService.saveArl(a, value);
             Toast.makeText(a, "ARL saved", Toast.LENGTH_SHORT).show();
             a.refreshStatus();
+        }
+    }
+
+    private static class SignInClick implements View.OnClickListener {
+        private final ConfigActivity a;
+        SignInClick(ConfigActivity a) { this.a = a; }
+        @Override
+        public void onClick(View v) {
+            a.startActivity(new Intent(a, DeezerLoginActivity.class));
         }
     }
 

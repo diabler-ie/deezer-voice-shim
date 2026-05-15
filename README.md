@@ -147,30 +147,47 @@ java -jar uber-apk-signer.jar --apks build/shim-unsigned.apk --allowResign
 
 ## How to install + configure
 
+**Prereqs (either install path):**
+- Real Spotify must not be installed — same package name conflict. Uninstall via Settings → Apps → Spotify, or `adb uninstall com.spotify.music`.
+- Real Deezer must be installed (Play Store build is fine; only used for the phone-mode UI hand-off).
+
+### Install option A: on-device, from the Releases page
+
+1. On the Android device, open the [releases page](https://github.com/diabler-ie/deezer-voice-shim/releases) in Chrome (or any browser).
+2. Tap the `.apk` asset on the latest release — it downloads.
+3. Open the downloaded file from the notification or Files app.
+4. Allow the browser to install unknown apps when prompted (one-time permission).
+5. Tap through any Play Protect prompt and install.
+
+### Install option B: adb sideload (developer / build-from-source path)
+
 ```bash
-# Uninstall the real Spotify (cannot coexist with shim — same package name)
-adb uninstall com.spotify.music
+adb uninstall com.spotify.music           # if real Spotify installed
+./build.sh                                # build/shim-unsigned.apk
+java -jar /path/to/uber-apk-signer.jar \
+    --apks build/shim-unsigned.apk --allowResign --overwrite
+adb install build/shim-unsigned.apk
+```
 
-# Install the signed shim
-adb install build/shim-unsigned-aligned-debugSigned.apk
+### Configure (both paths)
 
-# Make sure Deezer is also installed (Play Store version is fine; only used for
-# the phone-mode UI hand-off)
-adb shell pm path deezer.android.app
+Launch the shim from your app drawer and tap **"Sign in to Deezer"**. The app
+loads Deezer's own login page in an embedded WebView — sign in there (captcha
+/ MFA / device verification all handled by Deezer's page), and the ARL is
+captured and saved automatically. Your password is never seen or stored by
+the shim; it only harvests the resulting session cookie.
 
-# Configure the Deezer ARL cookie (your Deezer session token; extract from
-# logged-in browser via DevTools → Cookies → www.deezer.com → arl value)
-export DEEZER_ARL='<your arl>'
-adb shell "am start -n com.spotify.music/.DeezerTestActivity --es arl '$DEEZER_ARL'"
+If you'd rather paste an ARL manually, the config screen still has a paste
+field below the sign-in button.
 
-# Phone test (also works as a sanity check):
+```bash
+# Optional adb sanity check (after the ARL is configured):
 adb shell am startservice -n com.spotify.music/.ShimMediaBrowserService \
     --es query "bohemian rhapsody queen"
 # → music plays
-
-# Then trigger via voice:
-# "Hey Google, play [song] on Spotify"
 ```
+
+Then trigger via voice: *"Hey Google, play [song] on Spotify."*
 
 ## Limitations
 
@@ -179,7 +196,7 @@ adb shell am startservice -n com.spotify.music/.ShimMediaBrowserService \
 - **No Play Store update path** for the shim (re-signed APK).
 - **Requires Deezer Premium / HiFi for full-quality streams**. Free accounts only get 30s previews through the public API.
 - **Personal use only.** The ARL is your account credential; treat it like a password — never bake it into an APK you share. Released builds ship without one; each user pastes their own.
-- **ARL eventually expires** (typical: months). Re-run the configure step with a fresh ARL when it does.
+- **ARL eventually expires** (typical: months). Tap "Sign in to Deezer" again to refresh — fresh cookie, no work for you.
 - **Album/playlist matching is best-effort.** Gemini's NLU resolves the user's voice to a *specific Spotify catalog entry* and sends us that album/playlist as extras. Deezer's catalog of multi-artist compilations rarely matches Spotify's exactly (different curation, different licensing per region), so a query like *"play Top Hits 2024 on Spotify"* may land on a different "Top Hits 2024" compilation in Deezer than what Spotify has. Single tracks and artist radio work cleanly; albums/playlists are reasonable but imperfect.
 - **Compilation albums** (`artist=Various Artists`) are routed through Deezer's playlist search as a fallback, since Spotify often classifies "Top Hits"-style compilations as albums but Deezer treats them as playlists.
 
