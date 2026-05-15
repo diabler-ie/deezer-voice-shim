@@ -49,11 +49,15 @@ public class DeezerClient {
         public final String id;
         public final String title;
         public final String artist;
+        public final String coverUrl;   // may be null
+        public final long durationMs;   // 0 if unknown
 
-        public Track(String id, String title, String artist) {
+        public Track(String id, String title, String artist, String coverUrl, long durationMs) {
             this.id = id;
             this.title = title;
             this.artist = artist;
+            this.coverUrl = coverUrl;
+            this.durationMs = durationMs;
         }
     }
 
@@ -149,30 +153,61 @@ public class DeezerClient {
 
     /** Tracks of an album matched by name (with optional artist hint). */
     public List<Track> albumTracks(String albumName, String artistHint, int limit) throws IOException {
-        // /search/album?q= takes plain text; the field-prefix syntax (album:"x")
-        // only works on the general /search endpoint and returns inconsistent
-        // results, so we just concatenate.
         String q = artistHint != null && !artistHint.isEmpty()
                 ? albumName + " " + artistHint
                 : albumName;
-        JSONObject albumResp = getJson(PUBLIC_API + "/search/album?q="
-                + URLEncoder.encode(q, "UTF-8") + "&limit=5");
-        long albumId = pickBestMatch(albumResp, "title", albumName, "artist", artistHint);
+
+        // First try the type-specific endpoint.
+        long albumId = pickBestMatch(
+                getJson(PUBLIC_API + "/search/album?q="
+                        + URLEncoder.encode(q, "UTF-8") + "&limit=5"),
+                "title", albumName, "artist", artistHint);
+
+        // Deezer's /search/album index is weirdly incomplete (e.g. Jon Bellion's
+        // "The Human Condition" returns nothing) so we fall back to a track
+        // search and lift the album id off the top track that has the right
+        // album title.
+        if (albumId < 0) {
+            JSONObject trackResp = getJson(PUBLIC_API + "/search?q="
+                    + URLEncoder.encode(q, "UTF-8") + "&limit=25");
+            albumId = pickAlbumIdFromTrackResults(trackResp, albumName);
+        }
+
         if (albumId < 0) {
             throw new IOException("album not found: " + albumName
                     + (artistHint == null ? "" : " by " + artistHint));
         }
+
         try {
-            // /album/{id} returns the whole album incl. nested tracks
             JSONObject album = getJson(PUBLIC_API + "/album/" + albumId);
             JSONObject tracksObj = album.getJSONObject("tracks");
             JSONArray tracks = tracksObj.getJSONArray("data");
             JSONObject artistObj = album.optJSONObject("artist");
             String fallbackArtist = artistObj == null ? null : artistObj.optString("name");
-            return parseTrackArray(tracks, limit, fallbackArtist);
+            String fallbackCover = album.optString("cover_xl",
+                    album.optString("cover_big", album.optString("cover_medium", null)));
+            if (fallbackCover != null && fallbackCover.isEmpty()) fallbackCover = null;
+            return parseTrackArray(tracks, limit, fallbackArtist, fallbackCover);
         } catch (Exception e) {
             throw new IOException("albumTracks parse failed: " + e.getMessage(), e);
         }
+    }
+
+    private static long pickAlbumIdFromTrackResults(JSONObject resp, String albumName) {
+        try {
+            JSONArray data = resp.getJSONArray("data");
+            String target = albumName == null ? "" : albumName.toLowerCase();
+            for (int i = 0; i < data.length(); i++) {
+                JSONObject t = data.getJSONObject(i);
+                JSONObject album = t.optJSONObject("album");
+                if (album == null) continue;
+                String title = album.optString("title", "").toLowerCase();
+                if (title.equals(target) || (target.length() > 3 && title.contains(target))) {
+                    return album.optLong("id", -1);
+                }
+            }
+        } catch (Exception ignored) {}
+        return -1;
     }
 
     /** Tracks of a playlist matched by name. */
@@ -251,7 +286,7 @@ public class DeezerClient {
     private List<Track> parseTrackList(JSONObject root) throws IOException {
         try {
             JSONArray data = root.getJSONArray("data");
-            return parseTrackArray(data, data.length(), null);
+            return parseTrackArray(data, data.length(), null, null);
         } catch (Exception e) {
             throw new IOException("trackList parse failed: " + e.getMessage(), e);
         }
@@ -259,6 +294,11 @@ public class DeezerClient {
 
     private List<Track> parseTrackArray(JSONArray arr, int limit, String fallbackArtist)
             throws Exception {
+        return parseTrackArray(arr, limit, fallbackArtist, null);
+    }
+
+    private List<Track> parseTrackArray(JSONArray arr, int limit, String fallbackArtist,
+                                        String fallbackCover) throws Exception {
         List<Track> out = new java.util.ArrayList<>();
         int n = Math.min(arr.length(), limit);
         for (int i = 0; i < n; i++) {
@@ -267,10 +307,24 @@ public class DeezerClient {
             JSONObject artistObj = t.optJSONObject("artist");
             if (artistObj != null) artist = artistObj.optString("name", "");
             else artist = fallbackArtist == null ? "" : fallbackArtist;
+
+            String cover = null;
+            JSONObject albumObj = t.optJSONObject("album");
+            if (albumObj != null) {
+                cover = albumObj.optString("cover_xl",
+                            albumObj.optString("cover_big",
+                                albumObj.optString("cover_medium", "")));
+                if (cover.isEmpty()) cover = null;
+            }
+            if (cover == null) cover = fallbackCover;
+
+            long durSeconds = t.optLong("duration", 0);
             out.add(new Track(
                     String.valueOf(t.getLong("id")),
                     t.optString("title", ""),
-                    artist));
+                    artist,
+                    cover,
+                    durSeconds * 1000L));
         }
         return out;
     }

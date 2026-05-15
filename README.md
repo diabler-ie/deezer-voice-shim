@@ -97,11 +97,14 @@ For Android Auto specifically, Gemini sends `playFromUri` (not `playFromSearch`)
 - **Artist radio**: speaking "Play music by X" loads up to 30 of the artist's top tracks
 - **Album playback**: speaking "Play [album]" loads all album tracks
 - **Playlist playback**: speaking "Play [playlist]" via Deezer's playlist search
-- **Single-track**: speaking "Play [song]" finds and plays one track
+- **Single-track + radio continuation**: speaking "Play [song]" plays it, then auto-continues with that artist's top tracks (radio-style)
 - **Transport controls**: play/pause/skip-next/skip-previous via AA's UI or media keys, with proper `PlaybackState` updates
+- **Auto-advance** on track completion
 - **Audio focus**: requests focus correctly so other media (podcasts, etc.) duck/pause
 - **Foreground service + media notification** during playback
 - **In-app config UI**: tap the launcher icon to paste/manage the ARL cookie
+- **Album art + queue UI** in Android Auto and on the lockscreen
+- **Recoverable error state**: a failed lookup doesn't poison the session for subsequent voice commands
 
 ## Project layout
 

@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
+import android.media.MediaDescription;
 import android.media.MediaMetadata;
 import android.media.MediaPlayer;
 import android.media.browse.MediaBrowser;
@@ -318,7 +319,33 @@ public class ShimMediaBrowserService extends MediaBrowserService {
                         return;
                     }
                     Log.i(TAG, "single-track mode: " + query);
-                    tracks = svc.client.searchTracks(query, 1);
+                    List<DeezerClient.Track> requested = svc.client.searchTracks(query, 1);
+                    if (requested.isEmpty()) {
+                        svc.setErrorState("no tracks found");
+                        return;
+                    }
+                    tracks = new java.util.ArrayList<>();
+                    tracks.add(requested.get(0));
+                    // Continue with that artist's top tracks so playback naturally
+                    // segues into a radio-style stream after the requested song.
+                    String continueArtist = artist;
+                    if (continueArtist == null || continueArtist.isEmpty()) {
+                        continueArtist = requested.get(0).artist;
+                    }
+                    if (continueArtist != null && !continueArtist.isEmpty()) {
+                        try {
+                            List<DeezerClient.Track> more =
+                                    svc.client.artistTopTracks(continueArtist, 29);
+                            String firstId = requested.get(0).id;
+                            for (DeezerClient.Track t : more) {
+                                if (!t.id.equals(firstId)) tracks.add(t);
+                            }
+                            Log.i(TAG, "appended " + (tracks.size() - 1)
+                                    + " continuation tracks by " + continueArtist);
+                        } catch (Exception ex) {
+                            Log.w(TAG, "continuation load failed: " + ex.getMessage());
+                        }
+                    }
                 }
 
                 if (tracks.isEmpty()) {
@@ -347,6 +374,7 @@ public class ShimMediaBrowserService extends MediaBrowserService {
         public void run() {
             svc.queue = tracks;
             svc.queueIndex = 0;
+            svc.publishQueue();
             svc.startCurrentTrack();
         }
     }
@@ -589,28 +617,31 @@ public class ShimMediaBrowserService extends MediaBrowserService {
         return a;
     }
 
+    private PlaybackState.Builder baseStateBuilder() {
+        PlaybackState.Builder b = new PlaybackState.Builder()
+                .setActions(transportActions());
+        if (queueIndex >= 0 && queueIndex < queue.size()) {
+            b.setActiveQueueItemId(queueIndex);
+        }
+        return b;
+    }
+
     private void setBufferingState() {
-        PlaybackState state = new PlaybackState.Builder()
-                .setActions(transportActions())
+        session.setPlaybackState(baseStateBuilder()
                 .setState(PlaybackState.STATE_BUFFERING, 0, 1.0f)
-                .build();
-        session.setPlaybackState(state);
+                .build());
     }
 
     private void setPlayingState(long position, long duration) {
-        PlaybackState state = new PlaybackState.Builder()
-                .setActions(transportActions())
+        session.setPlaybackState(baseStateBuilder()
                 .setState(PlaybackState.STATE_PLAYING, position, 1.0f)
-                .build();
-        session.setPlaybackState(state);
+                .build());
     }
 
     private void setPausedState(long position, long duration) {
-        PlaybackState state = new PlaybackState.Builder()
-                .setActions(transportActions())
+        session.setPlaybackState(baseStateBuilder()
                 .setState(PlaybackState.STATE_PAUSED, position, 0.0f)
-                .build();
-        session.setPlaybackState(state);
+                .build());
     }
 
     private void setErrorState(String msg) {
@@ -636,7 +667,34 @@ public class ShimMediaBrowserService extends MediaBrowserService {
         b.putString(MediaMetadata.METADATA_KEY_DISPLAY_TITLE, track.title);
         b.putString(MediaMetadata.METADATA_KEY_DISPLAY_SUBTITLE, track.artist);
         b.putString(MediaMetadata.METADATA_KEY_MEDIA_ID, track.id);
+        if (track.durationMs > 0) {
+            b.putLong(MediaMetadata.METADATA_KEY_DURATION, track.durationMs);
+        }
+        if (track.coverUrl != null && !track.coverUrl.isEmpty()) {
+            b.putString(MediaMetadata.METADATA_KEY_ALBUM_ART_URI, track.coverUrl);
+            b.putString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI, track.coverUrl);
+            b.putString(MediaMetadata.METADATA_KEY_ART_URI, track.coverUrl);
+        }
         session.setMetadata(b.build());
+    }
+
+    /** Publish the full track queue to the MediaSession so AA can show it
+     *  and so Robin's heuristics see a fully populated player. */
+    private void publishQueue() {
+        List<MediaSession.QueueItem> items = new ArrayList<>(queue.size());
+        for (int i = 0; i < queue.size(); i++) {
+            DeezerClient.Track t = queue.get(i);
+            MediaDescription.Builder d = new MediaDescription.Builder()
+                    .setMediaId(t.id)
+                    .setTitle(t.title)
+                    .setSubtitle(t.artist);
+            if (t.coverUrl != null && !t.coverUrl.isEmpty()) {
+                d.setIconUri(android.net.Uri.parse(t.coverUrl));
+            }
+            items.add(new MediaSession.QueueItem(d.build(), i));
+        }
+        session.setQueue(items);
+        session.setQueueTitle("Up next");
     }
 
     // ---- helpers ----
