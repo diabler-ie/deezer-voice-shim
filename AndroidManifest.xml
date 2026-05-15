@@ -43,6 +43,9 @@
             </intent-filter>
         </activity>
 
+        <activity android:name="com.spotify.music.DeezerTestActivity"
+                  android:exported="true"/>
+
         <service android:name="com.spotify.music.ShimMediaBrowserService"
                  android:exported="true"
                  android:foregroundServiceType="mediaPlayback">

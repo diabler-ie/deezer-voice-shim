@@ -1,148 +1,173 @@
 # Deezer Voice Shim
 
-A tiny Android app that makes Google Assistant / Gemini voice commands play music on Deezer — by impersonating Spotify.
+A small Android app that makes Google Gemini's voice routing play your music on Deezer — by impersonating Spotify's package name, intercepting the voice intent, and playing the resolved track via a custom Deezer streaming player.
+
+Works on:
+- **Phone**: "Hey Google, play X on Spotify" → audio plays via Deezer
+- **Android Auto**: same voice command in the car → audio plays through car speakers via Deezer
 
 ## The problem
 
-On modern Android, saying *"Hey Google, play [song] on Deezer"* fails. The assistant either:
+On modern Android, saying *"Hey Google, play X on Deezer"* fails. Gemini's voice-routing layer doesn't dispatch `PLAY_MEDIA` intents to Deezer directly — likely because Deezer's partner integration with Google Assistant has lapsed or was never updated for the Gemini/Robin pipeline. The same voice command works perfectly for Spotify on the same device. The Deezer app's voice handler code is never even invoked — confirmed by `logcat` showing zero Deezer process activity.
 
-- Replies "I can't play music on Deezer directly" and gives up, or
-- Says "Playing [song] on Deezer" but plays an unrelated song / shows an error / does nothing
-
-The failure happens entirely on **Google's side**, before any code in the Deezer app runs. Gemini's voice-routing layer doesn't include Deezer in the list of music services it'll dispatch `PLAY_MEDIA` intents to — likely because Deezer's partner integration with Google Assistant has lapsed or was never updated for the Gemini/Robin pipeline. The same voice command works perfectly for Spotify on the same device, because Google routes those intents to `com.spotify.music`.
-
-Reproducible test: install both apps, voice "play X on Spotify" works; "play X on Deezer" doesn't. The Deezer process is never even invoked — confirmed via `logcat`.
+Manifest-level changes (declaring `androidx.car.app.category.MEDIA`, adding `MUSIC_PLAYER` intent filters, etc.) move Deezer from "completely ignored" to "noticed by Cast scanning," but don't fix the routing decision. The actual gate is in Google's voice-fulfillment layer and isn't patchable from the APK side.
 
 ## The workaround
 
-This repo is a small "shim" app that:
+A small "shim" app that:
 
-1. Installs with the package name `com.spotify.music` (the real Spotify must not be installed)
-2. Registers a `MediaBrowserService` and the standard Android-for-Cars metadata, so Google's routing accepts it
-3. Listens for the Activity intent Google emits to play a track (`VIEW https://open.spotify.com/...` with structured `artist`/`title`/`album` extras)
-4. Hits Deezer's free public Search API to resolve those structured fields into a Deezer track ID
-5. Launches Deezer with `deezer://www.deezer.com/track/<id>?autoplay=true`
+1. Installs with package name `com.spotify.music` (real Spotify must not be installed alongside)
+2. Registers a `MediaBrowserService` + `MediaSession` + the modern Android-for-Cars metadata, so Gemini accepts it as a valid voice fulfillment target
+3. Listens for both:
+   - **Phone path**: `Intent.ACTION_VIEW` on `https://open.spotify.com/*` URLs — handled in `MainActivity`
+   - **Android Auto path**: `MediaSession.Callback.onPlayFromUri` / `onPlayFromSearch` — handled in `ShimMediaBrowserService`
+4. Either path receives structured extras from Gemini (`android.intent.extra.artist`, `.title`, `.album`, `.focus`)
+5. Phone path: launches Deezer with a deep-link search URL (so Deezer's own UI handles playback)
+6. Android Auto path: runs the full custom player — Deezer auth → search resolve → HTTP stream → Blowfish-CBC chunk decryption on the fly → `MediaPlayer` + `MediaSession` + `PlaybackState` so AA gets real playback signals
 
-End-to-end voice → playback is about 750ms (most of which is the API call).
+End-to-end voice command → audio playing in AA: ~4 seconds (most of which is Deezer's API roundtrips).
 
-The phrasing you use is *"Play [song] on Spotify"* — and Deezer plays it. UX wart, but the only way to ride Google's routing decision.
+## How the AA path works
 
-### Why this works
+```
+User says "Play music by Doja Cat on Spotify" into AA's mic
+   ↓
+Gemini's NLU resolves → dispatches playFromUri to com.spotify.music
+   ↓
+ShimMediaBrowserService.onGetRoot accepts connection
+   ↓
+MediaSession.Callback.onPlayFromUri(
+   uri = https://open.spotify.com/artist/<spotify_id>,
+   extras = {
+     android.intent.extra.artist = "Doja Cat",
+     android.intent.extra.focus  = "vnd.android.cursor.item/artist",
+     ...
+   })
+   ↓
+Read structured extras (the Spotify ID itself is useless — different catalog)
+   ↓
+DeezerClient.authenticate()  via ARL cookie + cookie-jar session
+   ↓
+DeezerClient.searchTrack("Doja Cat")  → Deezer Search API
+   ↓
+DeezerClient.getStreamInfo(trackId)
+   - gw-light.php?method=song.getData  → TRACK_TOKEN
+   - media.deezer.com/v1/get_url       → encrypted stream URL (FLAC if HiFi)
+   - HEAD                              → content length
+   ↓
+StreamingMediaDataSource starts producer thread:
+   - HTTP GET stream URL
+   - For each 2048-byte chunk: if chunkIdx % 3 == 0, decrypt with
+     Blowfish-CBC using key = md5(trackId)[0:16] XOR md5(trackId)[16:32]
+     XOR "g4el58wc0zvf9na1"
+   - Write to in-memory buffer; readAt() blocks if more bytes needed than buffered
+   ↓
+MediaPlayer.setDataSource(streamingSource) → prepareAsync → start
+   ↓
+PlaybackState transitions: NONE → BUFFERING → PLAYING
+MediaMetadata: title, artist
+   ↓
+AA reads PlaybackState + MediaMetadata, renders its own UI on the car screen.
+Audio comes out of the car speakers via AA's audio routing.
+```
 
-- Google's intent dispatch is package-name-based with no signature verification for media routing
-- Google supplies structured query fields (`android.intent.extra.artist`, `.title`, `.album`, `.focus`) in the intent — better data than what Deezer's own voice handler ever receives
-- Deezer's public Search API needs no auth and returns track IDs for an artist+title query
-- Deezer has stable deep-link URIs (`deezer://www.deezer.com/track/<id>`) that auto-play a specific track
+The phone path is similar but ends at "open Deezer's app with a deep-link search URL." Deezer's UI then takes over. We use this path because on the phone, Deezer's full UI is useful; in AA, AA owns the UI and just needs the audio.
+
+## What we tried that didn't work (and why)
+
+Hours of investigation discovered:
+
+| Hypothesis | Status |
+|---|---|
+| Deezer's manifest is missing something Spotify declares | False — manifests are nearly identical |
+| Deezer's `MediaBrowserService` package validator rejects Gemini | False — Gemini is allow-listed |
+| Modern car-app declarations (`androidx.car.app.category.MEDIA`) on Deezer | Real but not the decisive lever — got Deezer "noticed" by Cast scanning but Gemini's routing still bypasses it |
+| Gemini server-side allowlist of trusted music partners | **True**, and not patchable |
+| Spotify works because of its package name + manifest declarations | **True** — and the package-name impersonation works (no signature check on the media routing path) |
+
+The Spotify URL we receive (`https://open.spotify.com/track/<id>` or `/artist/<id>`) is *unusable* — different catalog from Deezer. But Gemini also ships **structured extras** (`android.intent.extra.artist`, `.title`, `.album`, `.focus`) on the same intent, and those *are* usable. We ignore the URL and search Deezer with the structured fields.
+
+For Android Auto specifically, Gemini sends `playFromUri` (not `playFromSearch`) — and times out after ~10s if `PlaybackState` doesn't transition to `PLAYING`. The shim must implement `onPlayFromUri` and actually play audio fast enough.
+
+## Project layout
+
+```
+.
+├── AndroidManifest.xml      — claims `com.spotify.music`, all the music-app filters
+├── build.sh                 — manual aapt2 + javac + d8 build (no Gradle)
+├── res/
+│   ├── values/strings.xml
+│   └── xml/automotive_app_desc.xml
+└── src/com/spotify/music/
+    ├── DeezerClient.java         — protocol client: auth, search, get_url, decrypt
+    ├── StreamingMediaDataSource.java — MediaDataSource that streams + decrypts on-the-fly
+    ├── ShimMediaBrowserService.java  — MBS + MediaSession + MediaPlayer; the AA-mode player
+    ├── MainActivity.java         — phone-mode: receives open.spotify.com intents,
+    │                                hands off to Deezer's app via deep link
+    ├── DeezerTestActivity.java   — adb-driven test runner; also used to set the ARL
+    └── ShimCarAppService.java    — empty stub; only its manifest declaration matters
+```
 
 ## How to build
 
-Prerequisites:
-
-- macOS or Linux with `bash`
+Prerequisites on macOS:
 - Android SDK `build-tools;34.0.0` and `platforms;android-34` (installed via `sdkmanager`)
-- OpenJDK 17+ (the build script assumes a path; edit if yours differs)
-- `adb` to install on a device
-
-The included `build.sh` produces an unsigned APK:
+- OpenJDK 17+
+- `adb` to install
 
 ```bash
 ./build.sh
 # → build/shim-unsigned.apk
 ```
 
-Then sign it. The simplest way is [uber-apk-signer](https://github.com/patrickfav/uber-apk-signer):
+Then sign with [uber-apk-signer](https://github.com/patrickfav/uber-apk-signer):
 
 ```bash
 java -jar uber-apk-signer.jar --apks build/shim-unsigned.apk --allowResign
 ```
 
-## How to install
+## How to install + configure
 
 ```bash
-# 1. Uninstall the real Spotify (cannot coexist with shim — same package name)
+# Uninstall the real Spotify (cannot coexist with shim — same package name)
 adb uninstall com.spotify.music
 
-# 2. Install the signed shim
+# Install the signed shim
 adb install build/shim-unsigned-aligned-debugSigned.apk
 
-# 3. Make sure Deezer is installed (Play Store version is fine)
+# Make sure Deezer is also installed (Play Store version is fine; only used for
+# the phone-mode UI hand-off)
 adb shell pm path deezer.android.app
 
-# 4. Test
-#    On the phone, trigger Gemini and say "Play [song] on Spotify"
-#    Deezer should open and start playing
-```
+# Configure the Deezer ARL cookie (your Deezer session token; extract from
+# logged-in browser via DevTools → Cookies → www.deezer.com → arl value)
+export DEEZER_ARL='<your arl>'
+adb shell "am start -n com.spotify.music/.DeezerTestActivity --es arl '$DEEZER_ARL'"
 
-To watch what's happening, filter logcat by the `DeezerShim` tag:
+# Phone test (also works as a sanity check):
+adb shell am startservice -n com.spotify.music/.ShimMediaBrowserService \
+    --es query "bohemian rhapsody queen"
+# → music plays
 
-```bash
-adb logcat -s DeezerShim
-```
-
-## How it works internally
-
-```
-User says "Play Bohemian Rhapsody by Queen on Spotify"
-   ↓
-Google Gemini ("Robin") parses → routes PLAY_MEDIA to com.spotify.music
-   ↓
-Shim's ShimMediaBrowserService.onGetRoot is invoked (accepts connection)
-   ↓
-Google launches Intent.ACTION_VIEW with
-   data = https://open.spotify.com/track/<spotify_track_id>
-   extras = {
-     android.intent.extra.artist = "Queen"
-     android.intent.extra.title  = "Bohemian Rhapsody"
-     android.intent.extra.album  = "A Night at the Opera"
-     android.intent.extra.focus  = "vnd.android.cursor.item/audio"
-     android.intent.extra.START_PLAYBACK = true
-   }
-   ↓
-Shim's MainActivity catches it (intent filter on open.spotify.com)
-   ↓
-On a background thread, MainActivity hits Deezer's API:
-   https://api.deezer.com/search?q=artist:"Queen" track:"Bohemian Rhapsody"&limit=1
-   ↓
-Parses JSON → gets a Deezer track ID
-   ↓
-Launches: Intent.ACTION_VIEW
-   data = deezer://www.deezer.com/track/<deezer_track_id>?autoplay=true
-   package = deezer.android.app
-   ↓
-Deezer plays the track.
-```
-
-## Layout
-
-```
-.
-├── AndroidManifest.xml      — claims `com.spotify.music`, MediaBrowserService,
-│                              car-app declarations, URL intent filter
-├── build.sh                 — minimal Android build (aapt2 + javac + d8)
-├── res/
-│   ├── values/strings.xml
-│   └── xml/automotive_app_desc.xml
-└── src/com/spotify/music/
-    ├── MainActivity.java        — receives Robin's intent, calls API, hands off to Deezer
-    ├── ShimMediaBrowserService.java — MBS + MediaSession for Robin to discover
-    └── ShimCarAppService.java   — empty stub; only its manifest declaration matters
+# Then trigger via voice:
+# "Hey Google, play [song] on Spotify"
 ```
 
 ## Limitations
 
 - **Voice phrasing is "Spotify"**, not "Deezer." Cognitively jarring but works.
-- **Real Spotify cannot be installed.** Same package name. Pick one.
-- **Re-signed APK has no Play Store update path.** Manual re-install for updates.
-- **Tested only on the phone (Pixel 6a, Android 16).** Android Auto is a different routing pipeline; the shim probably doesn't play in the car yet — audio routing to the car speakers requires the music app to *own* the active media session and stream audio bytes, which would mean implementing a full Deezer player from scratch. The current shim hands off to the Deezer app, which is fine on a phone but not in AA.
-- **Edge cases:** if Deezer's catalog doesn't have an exact match for an obscure query, the shim falls through to opening Deezer's search screen rather than playing directly.
-- **No artist / no title:** if Google only supplies a partial query, the API call may not return useful results.
-- **Fragile contract:** if Google ever tightens Robin to verify package signatures, or changes the intent shape, this breaks silently.
+- **Real Spotify can't be installed alongside** (same package name).
+- **No Play Store update path** for the shim (re-signed APK).
+- **Requires Deezer Premium / HiFi for full-quality streams**. Free accounts only get 30s previews through the public API.
+- **Personal use only.** The ARL is your account credential; treat it like a password. Don't redistribute the resulting APK.
+- **ARL eventually expires** (typical: months). Re-run the configure step with a fresh ARL when it does.
+- **Currently single-track**: artist-radio queue / album / playlist handling are TODO.
 
 ## Legal / use
 
-This is for personal use only. It works around a routing decision in Google's voice assistant by claiming a package name that belongs to Spotify AB. It doesn't ship any Spotify or Deezer code; it doesn't modify either app; it doesn't bypass any DRM or paywall. But you should not redistribute the resulting APK or publish it under Spotify's name.
+This works around a routing decision in Google's voice assistant by claiming a package name that belongs to Spotify AB, and accesses Deezer streams via their internal protocol. It doesn't ship any Spotify or Deezer code; it doesn't modify either app; it doesn't bypass any DRM or paywall beyond what your Deezer Premium subscription already entitles you to. **Don't redistribute.**
 
 ## Acknowledgements
 
-- Built on top of Deezer's free public Search API
+- Deezer's protocol details from the open-source community (deemix, dzr-rs, etc.)
 - Google for shipping enough structured query metadata that this is even possible
