@@ -1,6 +1,6 @@
 # Deezer Voice Shim
 
-> **Research / personal-use only.** This project impersonates a third-party package identifier and accesses Deezer via an unofficial protocol. Use it with your own Deezer Premium account, on your own device. Do not redistribute compiled binaries or commercial-scale forks. See [LICENSE](LICENSE).
+> **Research / personal-use only.** This project impersonates a third-party package identifier and accesses Deezer via an unofficial protocol. Use it with your own Deezer Premium account, on your own device. Released APKs are convenience builds for individual hobbyist sideloading — please don't repackage them into commercial products or hosted services. See [LICENSE](LICENSE).
 
 A small Android app that makes Google Gemini's voice routing play your music on Deezer — by impersonating Spotify's package name, intercepting the voice intent, and playing the resolved track via a custom Deezer streaming player.
 
@@ -178,14 +178,14 @@ adb shell am startservice -n com.spotify.music/.ShimMediaBrowserService \
 - **Real Spotify can't be installed alongside** (same package name).
 - **No Play Store update path** for the shim (re-signed APK).
 - **Requires Deezer Premium / HiFi for full-quality streams**. Free accounts only get 30s previews through the public API.
-- **Personal use only.** The ARL is your account credential; treat it like a password. Don't redistribute the resulting APK.
+- **Personal use only.** The ARL is your account credential; treat it like a password — never bake it into an APK you share. Released builds ship without one; each user pastes their own.
 - **ARL eventually expires** (typical: months). Re-run the configure step with a fresh ARL when it does.
 - **Album/playlist matching is best-effort.** Gemini's NLU resolves the user's voice to a *specific Spotify catalog entry* and sends us that album/playlist as extras. Deezer's catalog of multi-artist compilations rarely matches Spotify's exactly (different curation, different licensing per region), so a query like *"play Top Hits 2024 on Spotify"* may land on a different "Top Hits 2024" compilation in Deezer than what Spotify has. Single tracks and artist radio work cleanly; albums/playlists are reasonable but imperfect.
 - **Compilation albums** (`artist=Various Artists`) are routed through Deezer's playlist search as a fallback, since Spotify often classifies "Top Hits"-style compilations as albums but Deezer treats them as playlists.
 
 ## Legal / use
 
-This works around a routing decision in Google's voice assistant by claiming a package name that belongs to Spotify AB, and accesses Deezer streams via their internal protocol. It doesn't ship any Spotify or Deezer code; it doesn't modify either app; it doesn't bypass any DRM or paywall beyond what your Deezer Premium subscription already entitles you to. **Don't redistribute.**
+This works around a routing decision in Google's voice assistant by claiming a package name that belongs to Spotify AB, and accesses Deezer streams via their internal protocol. It doesn't ship any Spotify or Deezer code; it doesn't modify either app; it doesn't bypass any DRM or paywall beyond what your Deezer Premium subscription already entitles you to. Released APKs are provided as a convenience for individual sideloaders — please don't repackage or host them as part of a commercial product or service.
 
 ## Acknowledgements
 
